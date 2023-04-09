@@ -809,21 +809,21 @@ app.get('/', (req, res) => {
     res.send('INTI API');
 });
 
-app.get('/inti/campus', (req, res) => {
+app.get('/campus', (req, res) => {
     res.send(campuses);
 });
 
-app.get('/inti/campus/:campusID', (req, res) => {
+app.get('/campus/:campusID', (req, res) => {
     const campus =  campuses.find(c => c.campusID === parseInt(req.params.campusID));
     if (!campus) res.status(404).send('The campus with the given ID was not found');
     res.send(campus);
 });
 
-app.get('/inti/programme', (req, res) => {
+app.get('/programme', (req, res) => {
     res.send(programme);
 });
 
-app.get('/inti/programme/:programmeID', (req, res) => {
+app.get('/programme/:programmeID', (req, res) => {
     let theProgram =  programme.find((program) => program.programmeID === req.params.programmeID);
     if (!theProgram) res.status(404).send('The program with the given ID was not found');
     res.send(theProgram);
