@@ -2,6 +2,30 @@ const express = require('express');
 const app = express();
 const bcrypt = require('bcryptjs')
 const bodyParser = require('body-parser');
+const crypto = require('crypto');
+
+const algorithm = 'aes-256-cbc';
+const key = crypto.randomBytes(32); 
+const iv = crypto.randomBytes(16);
+
+function encrypt(text) {
+  const cipher = crypto.createCipheriv(algorithm, key, iv);
+  let encrypted = cipher.update(text, 'utf8', 'hex');
+  encrypted += cipher.final('hex');
+  return encrypted + ':' + iv.toString('hex');
+}
+
+function decrypt(text) {
+  const parts = text.split(':');
+  const encryptedText = parts[0];
+  const iv = Buffer.from(parts[1], 'hex');
+
+  const decipher = crypto.createDecipheriv(algorithm, key, iv);
+  let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
+  decrypted += decipher.final('utf8');
+  return decrypted;
+}
+
 
 // add body-parser middleware to parse request bodies
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -1053,8 +1077,47 @@ app.get('/account', (req, res) => {
 });
 
 
+
+// app.post('/register', (req, res) => {
+//   const { name, studentID, ic, password } = req.body;
+
+//   // Hash the password
+//   bcrypt.hash(password, 10, (err, hashedPassword) => {
+//     if (err) {
+//       console.error('Error hashing password:', err);
+//       res.status(500).json({ error: 'Internal server error' });
+//     } else {
+//       // Create an account object with the hashed password
+//       const encryptedIC = encrypt(ic);
+
+//       const account = {
+//         name,
+//         studentID,
+//         ic: encryptedIC,
+//         password: hashedPassword,
+//       };
+
+//       // Store the account in the accounts array
+//       accounts.push(account);
+
+//       // Send the account object as the response
+//       res.json(account);
+//     }
+//   });
+// });
+
 app.post('/register', (req, res) => {
   const { name, studentID, ic, password } = req.body;
+
+  // Validate name (alphabets + spaces)
+  if (!/^[A-Za-z\s]+$/.test(name)) {
+    return res.status(400).json({ error: "Name must contain alphabets only" });
+  }
+
+  // Validate IC (numbers only)
+  if (!/^\d+$/.test(ic)) {
+    return res.status(400).json({ error: "IC must contain numbers only" });
+  }
 
   // Hash the password
   bcrypt.hash(password, 10, (err, hashedPassword) => {
@@ -1062,22 +1125,23 @@ app.post('/register', (req, res) => {
       console.error('Error hashing password:', err);
       res.status(500).json({ error: 'Internal server error' });
     } else {
-      // Create an account object with the hashed password
+
+      const encryptedIC = encrypt(ic);
+
       const account = {
         name,
         studentID,
-        ic,
+        ic: encryptedIC,
         password: hashedPassword,
       };
 
-      // Store the account in the accounts array (you can replace this with your database logic)
       accounts.push(account);
 
-      // Send the account object as the response
       res.json(account);
     }
   });
 });
+
 
 // Endpoint for password verification
 app.post('/login', (req, res) => {
