@@ -1118,6 +1118,61 @@ createTimeSlots();
 
 app.use(express.json());
 
+// --- ADDED: session management (in-memory) placed BEFORE route definitions ---
+const sessions = new Map(); // token -> { studentID, lastActivity }
+const SESSION_TIMEOUT = 10 * 60 * 1000; // 10 minutes
+
+function generateToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+function isPublicRoute(req) {
+  if (req.method === 'OPTIONS') return true;
+  // only these routes do NOT require token
+  const publicPaths = [
+    '/', '/login', '/register',
+    '/otp', '/otp/verify'
+  ];
+  return publicPaths.includes(req.path);
+}
+
+// Auth middleware: require "Authorization: Bearer <token>" for protected endpoints
+app.use((req, res, next) => {
+  if (isPublicRoute(req)) return next();
+
+  const auth = req.headers['authorization'];
+  if (!auth) return res.status(401).json({ error: 'Authorization header required' });
+
+  const parts = auth.split(' ');
+  if (parts.length !== 2 || parts[0] !== 'Bearer') {
+    return res.status(401).json({ error: 'Invalid authorization format' });
+  }
+
+  const token = parts[1];
+  const session = sessions.get(token);
+  if (!session) return res.status(401).json({ error: 'Invalid or expired token' });
+
+  const now = Date.now();
+  if (now - session.lastActivity > SESSION_TIMEOUT) {
+    sessions.delete(token);
+    return res.status(401).json({ error: 'Session expired due to inactivity' });
+  }
+
+  // refresh lastActivity (sliding window)
+  session.lastActivity = now;
+  req.session = session;
+  req.studentID = session.studentID;
+  next();
+});
+
+// periodic cleanup of expired sessions
+setInterval(() => {
+  const now = Date.now();
+  for (const [t, s] of sessions.entries()) {
+    if (now - s.lastActivity > SESSION_TIMEOUT) sessions.delete(t);
+  }
+}, 60 * 1000); // every minute
+
 app.get('/account', (req, res) => {
   res.send(accounts);
 });
@@ -1288,8 +1343,14 @@ app.post('/login', (req, res) => {
     }
 
     if (result) {
+      // successful login -> reset attempts, create session token and return safe account
       delete loginAttempts[studentID];
-      return res.json(account);
+
+      const token = generateToken();
+      sessions.set(token, { studentID: account.studentID, lastActivity: Date.now() });
+      const safeAccount = { ...account };
+      delete safeAccount.password;
+      return res.json({ account: safeAccount, token });
     }
 
     const newAttempts = (loginAttempts[studentID]?.attempts || 0) + 1;
