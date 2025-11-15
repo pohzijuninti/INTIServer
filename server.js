@@ -1032,19 +1032,19 @@ const accounts = [
     "name": "Poh Zi Jun",
     "studentID": "P21013627",
     "ic": "000711070807",
-    "password": "$2a$10$um1XdNi.Ol0tiGgck4RsTOeaiX9PHWGzpNzvnxrIaxqEwMkpYn37i"
+    "password": "$2a$10$PCr63A61gYJN.2qNJMYg4eVrwAE2H7uObdfzeQcqQU4byXAtdvUla"
   },
   {
     "name": "Amelia",
     "studentID": "P21013432",
     "ic": "03072471234",
-    "password": "$2a$10$CMMBYcwTRBDXKoDlLoFDW.BtMtB1TYQAlvlbd495ZoZTSCy4fhtwC"
+    "password": "$2a$10$PCr63A61gYJN.2qNJMYg4eVrwAE2H7uObdfzeQcqQU4byXAtdvUla"
   },
   {
     "name": "Ong Yu Chin",
     "studentID": "P21013395",
     "ic": "031026070000",
-    "password": "$2a$10$zD4ni6zGxRI2lFk02kugwuWZoOdtmWFoZColLlvCSFrZUsJkYsgIe"
+    "password": "$2a$10$PCr63A61gYJN.2qNJMYg4eVrwAE2H7uObdfzeQcqQU4byXAtdvUla"
   },
 ];
 
