@@ -1118,6 +1118,58 @@ createTimeSlots();
 
 app.use(express.json());
 
+// --- ADDED: per-IP rate limiter (100 requests / 1 minute, block IP for 1 hour) ---
+const RATE_WINDOW_MS = 60 * 1000; // 1 minute
+const RATE_MAX_REQUESTS = 100; // max requests per IP per window
+const IP_BLOCK_MS = 60 * 60 * 1000; // 1 hour block duration
+
+const ipCounters = new Map(); // ip -> { count, start }
+const blockedIPs = new Map(); // ip -> blockedUntil (timestamp)
+
+app.use((req, res, next) => {
+  const ip = (req.headers['x-forwarded-for'] || req.ip || req.connection.remoteAddress || '').split(',')[0].trim();
+  const now = Date.now();
+
+  // if currently blocked, reject
+  const blockedUntil = blockedIPs.get(ip);
+  if (blockedUntil && now < blockedUntil) {
+    return res.status(429).json({ error: 'Too many requests from this IP, temporarily blocked' });
+  } else if (blockedUntil && now >= blockedUntil) {
+    blockedIPs.delete(ip);
+  }
+
+  // sliding window counter
+  let entry = ipCounters.get(ip);
+  if (!entry || now - entry.start > RATE_WINDOW_MS) {
+    entry = { count: 1, start: now };
+    ipCounters.set(ip, entry);
+  } else {
+    entry.count++;
+  }
+
+  if (entry.count > RATE_MAX_REQUESTS) {
+    // block IP for 1 hour
+    blockedIPs.set(ip, now + IP_BLOCK_MS);
+    return res.status(429).json({ error: 'Rate limit exceeded. IP blocked for 1 hour.' });
+  }
+
+  next();
+});
+
+// periodic cleanup to avoid memory growth
+setInterval(() => {
+  const now = Date.now();
+  // cleanup counters older than window
+  for (const [ip, entry] of ipCounters.entries()) {
+    if (now - entry.start > RATE_WINDOW_MS) ipCounters.delete(ip);
+  }
+  // cleanup blocked entries older than block duration + buffer
+  const BUFFER = 10 * 60 * 1000; // 10 minutes
+  for (const [ip, until] of blockedIPs.entries()) {
+    if (now - until > BUFFER) blockedIPs.delete(ip);
+  }
+}, RATE_WINDOW_MS);
+
 // --- ADDED: session management (in-memory) placed BEFORE route definitions ---
 const sessions = new Map(); // token -> { studentID, lastActivity }
 const SESSION_TIMEOUT = 10 * 60 * 1000; // 10 minutes
