@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const express = require('express');
 const app = express();
 const bcrypt = require('bcryptjs')
@@ -7,6 +9,50 @@ const crypto = require('crypto');
 const algorithm = 'aes-256-cbc';
 const key = crypto.randomBytes(32); 
 const iv = crypto.randomBytes(16);
+
+const nodemailer = require('nodemailer');
+
+function parseBoolean(value, defaultValue = false) {
+  if (value === undefined || value === null) return defaultValue;
+  const normalized = String(value).trim().toLowerCase();
+  return ['true', '1', 'yes', 'on'].includes(normalized);
+}
+
+const mailEnabled = parseBoolean(process.env.MAIL_ENABLED, true);
+const emailUser = process.env.EMAIL_USER;
+const emailPass = (process.env.EMAIL_PASS || '').replace(/\s+/g, '');
+const mailFrom = process.env.MAIL_DEFAULT_SENDER || emailUser;
+
+let transporter = null;
+
+if (!mailEnabled) {
+  console.warn('Mail service disabled via MAIL_ENABLED flag.');
+} else if (!emailUser || !emailPass) {
+  console.warn('EMAIL_USER or EMAIL_PASS missing; OTP emails disabled.');
+} else {
+  const smtpHost = process.env.MAIL_SERVER || 'smtp.gmail.com';
+  const smtpPort = parseInt(process.env.MAIL_PORT, 10) || 587;
+  const useSsl = parseBoolean(process.env.MAIL_USE_SSL, smtpPort === 465);
+  const requireTls = parseBoolean(process.env.MAIL_USE_TLS, smtpPort === 587);
+
+  transporter = nodemailer.createTransport({
+    host: smtpHost,
+    port: smtpPort,
+    secure: useSsl,
+    requireTLS: requireTls,
+    auth: {
+      user: emailUser,
+      pass: emailPass,
+    },
+  });
+}
+
+const otps = {}; // { [studentID]: { code, expiresAt } }
+const loginAttempts = {}; // { [studentID]: { attempts, lockUntil } }
+
+const MAX_LOGIN_ATTEMPTS = parseInt(process.env.LOGIN_MAX_ATTEMPTS, 10) || 5;
+const LOCK_DURATION_MINUTES = parseInt(process.env.LOGIN_LOCK_MINUTES, 10) || 15;
+const LOCK_DURATION_MS = LOCK_DURATION_MINUTES * 60 * 1000;
 
 function encrypt(text) {
   const cipher = crypto.createCipheriv(algorithm, key, iv);
@@ -1142,6 +1188,73 @@ app.post('/register', (req, res) => {
   });
 });
 
+app.post('/otp', async (req, res) => {
+  const { studentID } = req.body;
+
+  // 1. Check user exists
+  const account = accounts.find(acc => acc.studentID === studentID);
+  if (!account) {
+    return res.status(404).json({ error: 'Account not found' });
+  }
+
+  // 2. Generate 6-digit OTP
+  const otp = crypto.randomInt(100000, 999999).toString();
+
+  // 3. Set expiry (5 minutes)
+  const expiresAt = Date.now() + 5 * 60 * 1000;
+  otps[studentID] = { code: otp, expiresAt };
+
+  // 4. Build email from studentID
+  const email = `${studentID}@student.newinti.edu.my`;
+
+  if (!transporter) {
+    console.error('Mail transporter not configured; cannot send OTP.');
+    return res.status(503).json({ error: 'Mail service is not configured' });
+  }
+
+  try {
+    await transporter.sendMail({
+      from: mailFrom,
+      to: email,
+      subject: 'Your INTI App OTP Code',
+      text: `Your OTP code is: ${otp}. It will expire in 5 minutes.`,
+    });
+
+    res.json({
+  
+      message: 'OTP has been sent to your INTI student email',
+    });
+  } catch (err) {
+    console.error('Error sending email:', err);
+    res.status(500).json({ error: 'Failed to send OTP email' });
+  }
+});
+
+app.post('/otp/verify', (req, res) => {
+  const { studentID, otp } = req.body;
+
+  if (!studentID || !otp) {
+    return res.status(400).json({ error: 'Student ID and OTP are required' });
+  }
+
+  const record = otps[studentID];
+
+  if (!record) {
+    return res.status(404).json({ error: 'OTP not found. Please request a new one.' });
+  }
+
+  if (Date.now() > record.expiresAt) {
+    delete otps[studentID];
+    return res.status(410).json({ error: 'OTP has expired. Please request a new one.' });
+  }
+
+  if (record.code !== otp) {
+    return res.status(401).json({ error: 'Invalid OTP code' });
+  }
+
+  delete otps[studentID];
+  res.json({ message: 'OTP verified successfully' });
+});
 
 // Endpoint for password verification
 app.post('/login', (req, res) => {
@@ -1151,20 +1264,54 @@ app.post('/login', (req, res) => {
   const account = accounts.find((acc) => acc.studentID === studentID);
 
   if (!account) {
-    res.status(404).json({ error: 'Account not found' });
-  } else {
-    // Compare the entered password with the stored hashed password
-    bcrypt.compare(password, account.password, (err, result) => {
-      if (err) {
-        console.error('Error comparing passwords:', err);
-        res.status(500).json({ error: 'Internal server error' });
-      } else if (result) {
-        res.json(account);
-      } else {
-        res.status(401).json({ error: 'Incorrect password' });
-      }
-    });
+    return res.status(404).json({ error: 'Account not found' });
   }
+
+  const attemptInfo = loginAttempts[studentID];
+  if (attemptInfo && attemptInfo.lockUntil) {
+    if (Date.now() < attemptInfo.lockUntil) {
+      const remainingMs = attemptInfo.lockUntil - Date.now();
+      return res.status(423).json({
+        error: 'Account temporarily locked due to multiple failed attempts',
+        unlockInSeconds: Math.ceil(remainingMs / 1000),
+      });
+    }
+    // Lock expired, reset attempts
+    delete loginAttempts[studentID];
+  }
+
+  // Compare the entered password with the stored hashed password
+  bcrypt.compare(password, account.password, (err, result) => {
+    if (err) {
+      console.error('Error comparing passwords:', err);
+      return res.status(500).json({ error: 'Internal server error' });
+    }
+
+    if (result) {
+      delete loginAttempts[studentID];
+      return res.json(account);
+    }
+
+    const newAttempts = (loginAttempts[studentID]?.attempts || 0) + 1;
+    const shouldLock = newAttempts >= MAX_LOGIN_ATTEMPTS;
+    loginAttempts[studentID] = {
+      attempts: shouldLock ? MAX_LOGIN_ATTEMPTS : newAttempts,
+      lockUntil: shouldLock ? Date.now() + LOCK_DURATION_MS : undefined,
+    };
+
+    const responseBody = { error: 'Incorrect password' };
+    if (shouldLock) {
+      responseBody.locked = true;
+      responseBody.unlockInSeconds = Math.ceil(LOCK_DURATION_MS / 1000);
+    } else {
+      responseBody.remainingAttempts = Math.max(
+        0,
+        MAX_LOGIN_ATTEMPTS - newAttempts
+      );
+    }
+
+    return res.status(401).json(responseBody);
+  });
 });
 
 
