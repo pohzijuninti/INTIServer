@@ -1369,9 +1369,9 @@ app.post('/otp', async (req, res) => {
   }
 
   try {
-    const account = await findAccountByStudentID(studentID);
-    if (!account) {
-      return res.status(404).json({ error: 'Account not found' });
+    const existingAccount = await findAccountByStudentID(studentID);
+    if (existingAccount) {
+      return res.status(409).json({ error: 'Student ID already registered. Please log in instead.' });
     }
 
     const otp = crypto.randomInt(100000, 999999).toString();
