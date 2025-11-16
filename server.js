@@ -5,6 +5,7 @@ const app = express();
 const bcrypt = require('bcryptjs')
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
+const { Pool } = require('pg');
 
 const algorithm = 'aes-256-cbc';
 const key = crypto.randomBytes(32); 
@@ -47,6 +48,43 @@ if (!mailEnabled) {
   });
 }
 
+const dbPort = parseInt(process.env.DB_PORT, 10) || 5432;
+const dbConfig = {
+  host: process.env.DB_HOST || '127.0.0.1',
+  port: dbPort,
+  database: process.env.DB_NAME || 'inti_app',
+  user: process.env.DB_USER || 'postgres',
+  password: process.env.DB_PASSWORD || '',
+  ssl: parseBoolean(process.env.DB_SSL, false)
+    ? { rejectUnauthorized: false }
+    : false,
+};
+
+const pool = new Pool(dbConfig);
+pool.on('error', (err) => {
+  console.error('Unexpected PostgreSQL client error', err);
+});
+
+async function initializeDatabase() {
+  const createAccountsTable = `
+    CREATE TABLE IF NOT EXISTS accounts (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      student_id VARCHAR(32) NOT NULL UNIQUE,
+      ic TEXT NOT NULL,
+      password_hash TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `;
+  await pool.query(createAccountsTable);
+  console.log('Connected to PostgreSQL and ensured accounts table exists.');
+}
+
+initializeDatabase().catch((error) => {
+  console.error('Failed to initialize PostgreSQL database:', error);
+  process.exit(1);
+});
+
 const otps = {}; // { [studentID]: { code, expiresAt } }
 const loginAttempts = {}; // { [studentID]: { attempts, lockUntil } }
 
@@ -70,6 +108,44 @@ function decrypt(text) {
   let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
   decrypted += decipher.final('utf8');
   return decrypted;
+}
+
+function sanitizeAccountRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    name: row.name,
+    studentID: row.student_id,
+    ic: row.ic,
+    createdAt: row.created_at,
+  };
+}
+
+async function findAccountByStudentID(studentID) {
+  if (!studentID) return null;
+  const { rows } = await pool.query(
+    'SELECT id, name, student_id, ic, password_hash, created_at FROM accounts WHERE student_id = $1',
+    [studentID]
+  );
+  return rows[0];
+}
+
+function hashPasswordAsync(password) {
+  return new Promise((resolve, reject) => {
+    bcrypt.hash(password, 10, (err, hashedPassword) => {
+      if (err) return reject(err);
+      resolve(hashedPassword);
+    });
+  });
+}
+
+function comparePasswordAsync(password, hashedPassword) {
+  return new Promise((resolve, reject) => {
+    bcrypt.compare(password, hashedPassword, (err, same) => {
+      if (err) return reject(err);
+      resolve(same);
+    });
+  });
 }
 
 
@@ -1073,27 +1149,6 @@ const orders = [];
 const orderFoods = [];
 const bookStudents = [];
 
-const accounts = [
-  {
-    "name": "Poh Zi Jun",
-    "studentID": "P21013627",
-    "ic": "000711070807",
-    "password": "$2a$10$PCr63A61gYJN.2qNJMYg4eVrwAE2H7uObdfzeQcqQU4byXAtdvUla"
-  },
-  {
-    "name": "Amelia",
-    "studentID": "P21013432",
-    "ic": "03072471234",
-    "password": "$2a$10$PCr63A61gYJN.2qNJMYg4eVrwAE2H7uObdfzeQcqQU4byXAtdvUla"
-  },
-  {
-    "name": "Ong Yu Chin",
-    "studentID": "P21013395",
-    "ic": "031026070000",
-    "password": "$2a$10$PCr63A61gYJN.2qNJMYg4eVrwAE2H7uObdfzeQcqQU4byXAtdvUla"
-  },
-];
-
 let timeSlots = [];
 
 function createTimeSlots() {
@@ -1225,8 +1280,16 @@ setInterval(() => {
   }
 }, 60 * 1000); // every minute
 
-app.get('/account', (req, res) => {
-  res.send(accounts);
+app.get('/account', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, name, student_id, ic, created_at FROM accounts ORDER BY created_at DESC'
+    );
+    res.send(rows.map(sanitizeAccountRow));
+  } catch (error) {
+    console.error('Error fetching accounts:', error);
+    res.status(500).json({ error: 'Failed to retrieve accounts' });
+  }
 });
 
 
@@ -1259,81 +1322,84 @@ app.get('/account', (req, res) => {
 //   });
 // });
 
-app.post('/register', (req, res) => {
+app.post('/register', async (req, res) => {
   const { name, studentID, ic, password } = req.body;
+
+  if (!name || !studentID || !ic || !password) {
+    return res.status(400).json({ error: 'All fields are required' });
+  }
 
   // Validate name (alphabets + spaces)
   if (!/^[A-Za-z\s]+$/.test(name)) {
-    return res.status(400).json({ error: "Name must contain alphabets only" });
+    return res.status(400).json({ error: 'Name must contain alphabets only' });
   }
 
   // Validate IC (numbers only)
   if (!/^\d+$/.test(ic)) {
-    return res.status(400).json({ error: "IC must contain numbers only" });
+    return res.status(400).json({ error: 'IC must contain numbers only' });
   }
 
-  // Hash the password
-  bcrypt.hash(password, 10, (err, hashedPassword) => {
-    if (err) {
-      console.error('Error hashing password:', err);
-      res.status(500).json({ error: 'Internal server error' });
-    } else {
-
-      const encryptedIC = encrypt(ic);
-
-      const account = {
-        name,
-        studentID,
-        ic: encryptedIC,
-        password: hashedPassword,
-      };
-
-      accounts.push(account);
-
-      res.json(account);
+  try {
+    const existingAccount = await findAccountByStudentID(studentID);
+    if (existingAccount) {
+      return res.status(409).json({ error: 'Student ID already registered' });
     }
-  });
+
+    const hashedPassword = await hashPasswordAsync(password);
+    const encryptedIC = encrypt(ic);
+
+    const { rows } = await pool.query(
+      'INSERT INTO accounts (name, student_id, ic, password_hash) VALUES ($1, $2, $3, $4) RETURNING id, name, student_id, ic, created_at',
+      [name, studentID, encryptedIC, hashedPassword]
+    );
+
+    const createdAccount = sanitizeAccountRow(rows[0]);
+    res.json(createdAccount);
+  } catch (error) {
+    console.error('Error registering account:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 app.post('/otp', async (req, res) => {
   const { studentID } = req.body;
 
-  // 1. Check user exists
-  const account = accounts.find(acc => acc.studentID === studentID);
-  if (!account) {
-    return res.status(404).json({ error: 'Account not found' });
-  }
-
-  // 2. Generate 6-digit OTP
-  const otp = crypto.randomInt(100000, 999999).toString();
-
-  // 3. Set expiry (5 minutes)
-  const expiresAt = Date.now() + 5 * 60 * 1000;
-  otps[studentID] = { code: otp, expiresAt };
-
-  // 4. Build email from studentID
-  const email = `${studentID}@student.newinti.edu.my`;
-
-  if (!transporter) {
-    console.error('Mail transporter not configured; cannot send OTP.');
-    return res.status(503).json({ error: 'Mail service is not configured' });
+  if (!studentID) {
+    return res.status(400).json({ error: 'Student ID is required' });
   }
 
   try {
-    await transporter.sendMail({
-      from: mailFrom,
-      to: email,
-      subject: 'Your INTI App OTP Code',
-      text: `Your OTP code is: ${otp}. It will expire in 5 minutes.`,
-    });
+    const account = await findAccountByStudentID(studentID);
+    if (!account) {
+      return res.status(404).json({ error: 'Account not found' });
+    }
 
-    res.json({
-  
-      message: 'OTP has been sent to your INTI student email',
-    });
-  } catch (err) {
-    console.error('Error sending email:', err);
-    res.status(500).json({ error: 'Failed to send OTP email' });
+    const otp = crypto.randomInt(100000, 999999).toString();
+    const expiresAt = Date.now() + 5 * 60 * 1000;
+    otps[studentID] = { code: otp, expiresAt };
+    const email = `${studentID}@student.newinti.edu.my`;
+
+    if (!transporter) {
+      console.error('Mail transporter not configured; cannot send OTP.');
+      return res.status(503).json({ error: 'Mail service is not configured' });
+    }
+
+    try {
+      await transporter.sendMail({
+        from: mailFrom,
+        to: email,
+        subject: 'Your INTI App OTP Code',
+        text: `Your OTP code is: ${otp}. It will expire in 5 minutes.`,
+      });
+
+      res.json({ message: 'OTP has been sent to your INTI student email' });
+    } catch (err) {
+      console.error('Error sending email:', err);
+      res.status(500).json({ error: 'Failed to send OTP email' });
+    }
+  } catch (error) {
+    console.error('Error handling OTP request:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1364,44 +1430,37 @@ app.post('/otp/verify', (req, res) => {
 });
 
 // Endpoint for password verification
-app.post('/login', (req, res) => {
+app.post('/login', async (req, res) => {
   const { studentID, password } = req.body;
 
-  // Find the account with the matching studentID (you can replace this with your database logic)
-  const account = accounts.find((acc) => acc.studentID === studentID);
-
-  if (!account) {
-    return res.status(404).json({ error: 'Account not found' });
+  if (!studentID || !password) {
+    return res.status(400).json({ error: 'Student ID and password are required' });
   }
 
-  const attemptInfo = loginAttempts[studentID];
-  if (attemptInfo && attemptInfo.lockUntil) {
-    if (Date.now() < attemptInfo.lockUntil) {
-      const remainingMs = attemptInfo.lockUntil - Date.now();
-      return res.status(423).json({
-        error: 'Account temporarily locked due to multiple failed attempts',
-        unlockInSeconds: Math.ceil(remainingMs / 1000),
-      });
-    }
-    // Lock expired, reset attempts
-    delete loginAttempts[studentID];
-  }
-
-  // Compare the entered password with the stored hashed password
-  bcrypt.compare(password, account.password, (err, result) => {
-    if (err) {
-      console.error('Error comparing passwords:', err);
-      return res.status(500).json({ error: 'Internal server error' });
+  try {
+    const account = await findAccountByStudentID(studentID);
+    if (!account) {
+      return res.status(404).json({ error: 'Account not found' });
     }
 
-    if (result) {
-      // successful login -> reset attempts, create session token and return safe account
+    const attemptInfo = loginAttempts[studentID];
+    if (attemptInfo && attemptInfo.lockUntil) {
+      if (Date.now() < attemptInfo.lockUntil) {
+        const remainingMs = attemptInfo.lockUntil - Date.now();
+        return res.status(423).json({
+          error: 'Account temporarily locked due to multiple failed attempts',
+          unlockInSeconds: Math.ceil(remainingMs / 1000),
+        });
+      }
       delete loginAttempts[studentID];
+    }
 
+    const passwordMatches = await comparePasswordAsync(password, account.password_hash);
+    if (passwordMatches) {
+      delete loginAttempts[studentID];
       const token = generateToken();
-      sessions.set(token, { studentID: account.studentID, lastActivity: Date.now() });
-      const safeAccount = { ...account };
-      delete safeAccount.password;
+      sessions.set(token, { studentID: account.student_id, lastActivity: Date.now() });
+      const safeAccount = sanitizeAccountRow(account);
       return res.json({ account: safeAccount, token });
     }
 
@@ -1417,14 +1476,14 @@ app.post('/login', (req, res) => {
       responseBody.locked = true;
       responseBody.unlockInSeconds = Math.ceil(LOCK_DURATION_MS / 1000);
     } else {
-      responseBody.remainingAttempts = Math.max(
-        0,
-        MAX_LOGIN_ATTEMPTS - newAttempts
-      );
+      responseBody.remainingAttempts = Math.max(0, MAX_LOGIN_ATTEMPTS - newAttempts);
     }
 
     return res.status(401).json(responseBody);
-  });
+  } catch (error) {
+    console.error('Error during login:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 
