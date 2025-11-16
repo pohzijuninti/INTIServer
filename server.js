@@ -2,7 +2,6 @@ require('dotenv').config();
 
 const express = require('express');
 const app = express();
-const bcrypt = require('bcryptjs')
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
 const { Pool } = require('pg');
@@ -121,6 +120,12 @@ function sanitizeAccountRow(row) {
   };
 }
 
+function normalizeSha256Hash(value) {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().toLowerCase();
+  return /^[a-f0-9]{64}$/.test(normalized) ? normalized : null;
+}
+
 async function findAccountByStudentID(studentID) {
   if (!studentID) return null;
   const { rows } = await pool.query(
@@ -128,24 +133,6 @@ async function findAccountByStudentID(studentID) {
     [studentID]
   );
   return rows[0];
-}
-
-function hashPasswordAsync(password) {
-  return new Promise((resolve, reject) => {
-    bcrypt.hash(password, 10, (err, hashedPassword) => {
-      if (err) return reject(err);
-      resolve(hashedPassword);
-    });
-  });
-}
-
-function comparePasswordAsync(password, hashedPassword) {
-  return new Promise((resolve, reject) => {
-    bcrypt.compare(password, hashedPassword, (err, same) => {
-      if (err) return reject(err);
-      resolve(same);
-    });
-  });
 }
 
 
@@ -1329,6 +1316,11 @@ app.post('/register', async (req, res) => {
     return res.status(400).json({ error: 'All fields are required' });
   }
 
+  const normalizedPassword = normalizeSha256Hash(password);
+  if (!normalizedPassword) {
+    return res.status(400).json({ error: 'Password must be a SHA-256 hash string' });
+  }
+
   // Validate name (alphabets + spaces)
   if (!/^[A-Za-z\s]+$/.test(name)) {
     return res.status(400).json({ error: 'Name must contain alphabets only' });
@@ -1345,12 +1337,11 @@ app.post('/register', async (req, res) => {
       return res.status(409).json({ error: 'Student ID already registered' });
     }
 
-    const hashedPassword = await hashPasswordAsync(password);
     const encryptedIC = encrypt(ic);
 
     const { rows } = await pool.query(
       'INSERT INTO accounts (name, student_id, ic, password_hash) VALUES ($1, $2, $3, $4) RETURNING id, name, student_id, ic, created_at',
-      [name, studentID, encryptedIC, hashedPassword]
+      [name, studentID, encryptedIC, normalizedPassword]
     );
 
     const createdAccount = sanitizeAccountRow(rows[0]);
@@ -1437,6 +1428,11 @@ app.post('/login', async (req, res) => {
     return res.status(400).json({ error: 'Student ID and password are required' });
   }
 
+  const normalizedPassword = normalizeSha256Hash(password);
+  if (!normalizedPassword) {
+    return res.status(400).json({ error: 'Password must be a SHA-256 hash string' });
+  }
+
   try {
     const account = await findAccountByStudentID(studentID);
     if (!account) {
@@ -1455,8 +1451,7 @@ app.post('/login', async (req, res) => {
       delete loginAttempts[studentID];
     }
 
-    const passwordMatches = await comparePasswordAsync(password, account.password_hash);
-    if (passwordMatches) {
+    if (account.password_hash === normalizedPassword) {
       delete loginAttempts[studentID];
       const token = generateToken();
       sessions.set(token, { studentID: account.student_id, lastActivity: Date.now() });
